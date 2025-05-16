@@ -1,0 +1,326 @@
+"use client"
+
+import { useState, useRef, useEffect } from "react"
+import { ethers } from "ethers"
+import { getEscrowContract } from "@/lib/getEscrowContract"
+
+export default function CreateInvoiceModal({ onClose, onCreateInvoice }) {
+  const [messages, setMessages] = useState([
+    {
+      role: "assistant",
+      content:
+        "Hi there! I'll help you create an invoice. Please describe the work, the amount in FTN, and the deadline (YYYY-MM-DD).",
+    },
+  ])
+  const [input, setInput] = useState("")
+  const [isProcessing, setIsProcessing] = useState(false)
+  const [extractedData, setExtractedData] = useState(null)
+  const [step, setStep] = useState("chat") // chat, review, stake
+  const [stakeAmount, setStakeAmount] = useState("")
+
+  const messagesEndRef = useRef(null)
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
+  }, [messages])
+
+  const handleSendMessage = async (e) => {
+    e.preventDefault()
+    if (!input.trim() || isProcessing) return
+
+    setIsProcessing(true)
+    setMessages((m) => [...m, { role: "user", content: input }])
+    setInput("")
+
+    try {
+      const resp = await fetch("/api/extract-invoice", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: input }),
+      })
+
+      if (!resp.ok) {
+        const text = await resp.text()
+        console.error("API error:", resp.status, text)
+        setMessages((m) => [
+          ...m,
+          { role: "assistant", content: `Server error (${resp.status})` },
+        ])
+        return
+      }
+
+      const payload = await resp.json()
+      if (!payload.extracted) {
+        console.error("Missing payload.extracted:", payload)
+        setMessages((m) => [
+          ...m,
+          { role: "assistant", content: `Couldn't extract invoice data.` },
+        ])
+        return
+      }
+
+      const ext = payload.extracted
+      setExtractedData(ext)
+      setStep("review")
+      setMessages((m) => [
+        ...m,
+        {
+          role: "assistant",
+          content:
+            `Got it! I extracted:\n` +
+            `• Service: ${ext.title}\n` +
+            `• Amount: ${ext.amount} FTN\n` +
+            `• Deadline: ${ext.deadline}\n\n` +
+            `Please confirm or edit.`,
+          isAction: true,
+        },
+      ])
+    } catch (err) {
+      console.error("handleSendMessage failed:", err)
+      setMessages((m) => [
+        ...m,
+        { role: "assistant", content: `Oops, something went wrong.` },
+      ])
+    } finally {
+      setIsProcessing(false)
+    }
+  }
+
+  const handleConfirmDetails = () => {
+    setStep("stake")
+    setMessages((m) => [
+      ...m,
+      {
+        role: "assistant",
+        content: "Great! How much FTN would you like to stake as collateral?",
+      },
+    ])
+  }
+
+  const handleEditDetails = () => {
+    setExtractedData(null)
+    setStep("chat")
+    setMessages((m) => [
+      ...m,
+      { role: "assistant", content: "Sure—please provide the updated details." },
+    ])
+  }
+  const handleStakeAndCreate = async () => {
+    if (!stakeAmount || parseFloat(stakeAmount) <= 0) {
+      setMessages((m) => [
+        ...m,
+        { role: "assistant", content: "Enter a valid stake amount first." },
+      ])
+      return
+    }
+  
+    const [year, month, day] = extractedData.deadline
+      .split("-")
+      .map(Number)
+  
+    if (!year || !month || !day) {
+      setMessages((m) => [
+        ...m,
+        {
+          role: "assistant",
+          content: "Invalid deadline format. Use YYYY-MM-DD.",
+        },
+      ])
+      return
+    }
+  
+    const deadlineTs = Math.floor(
+      Date.UTC(year, month - 1, day, 23, 59, 59) / 1000
+    )
+    const nowTs = Math.floor(Date.now() / 1000)
+    if (deadlineTs <= nowTs) {
+      setMessages((m) => [
+        ...m,
+        {
+          role: "assistant",
+          content:
+            "That deadline is already in the past. Please choose a future date.",
+        },
+      ])
+      return
+    }
+  
+    setIsProcessing(true)
+    setMessages((m) => [
+      ...m,
+      {
+        role: "assistant",
+        content: `Staking ${stakeAmount} FTN and creating invoice…`,
+      },
+    ])
+  
+    try {
+      const { contract } = await getEscrowContract()
+      const amountWei = ethers.parseEther(extractedData.amount.toString())
+      const stakeWei = ethers.parseEther(stakeAmount)
+  
+      const tx = await contract.createInvoice(
+        extractedData.title,
+        extractedData.description || extractedData.title,
+        amountWei,
+        deadlineTs,
+        { value: stakeWei }
+      )
+      const receipt = await tx.wait()
+  
+      const event = receipt.logs
+        .map((log) => {
+          try {
+            return contract.interface.parseLog(log)
+          } catch {
+            return null
+          }
+        })
+        .find((e) => e && e.name === "InvoiceCreated")
+  
+      if (!event) throw new Error("InvoiceCreated event not found")
+  
+      const onChainId = event.args.id.toString()
+      const onChainDeadline = Number(event.args.deadline)
+  
+      console.log("✅ onChain invoiceId:", onChainId)
+      console.log("🗓️ onChain deadline:", onChainDeadline, new Date(onChainDeadline * 1000).toISOString())
+  
+      const deadlineIso = new Date(onChainDeadline * 1000)
+        .toISOString()
+        .split("T")[0]
+  
+      onCreateInvoice({
+        id: onChainId,
+        title: extractedData.title,
+        description: extractedData.description,
+        amount: extractedData.amount,
+        deadline: deadlineIso,
+        stakeAmount: parseFloat(stakeAmount),
+        status: "staked",
+        date: new Date().toISOString().split("T")[0],
+      })
+  
+      setMessages((m) => [
+        ...m,
+        { role: "assistant", content: "✅ Invoice created on-chain!" },
+      ])
+      onClose()
+    } catch (err) {
+      console.error(err)
+      setMessages((m) => [
+        ...m,
+        { role: "assistant", content: `Transaction failed: ${err.message}` },
+      ])
+    } finally {
+      setIsProcessing(false)
+    }
+  }
+  
+  
+
+
+  return (
+    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+      <div className="bg-white rounded-lg w-full max-w-md mx-4 flex flex-col h-[80vh]">
+        {/* Header */}
+        <div className="p-4 border-b flex justify-between items-center">
+          <h2 className="text-xl font-bold">
+            {step === "chat"
+              ? "AI Invoice Assistant"
+              : step === "review"
+              ? "Review Invoice"
+              : "Stake & Create"}
+          </h2>
+          <button onClick={onClose} className="text-gray-500 hover:text-gray-700">
+            ✕
+          </button>
+        </div>
+
+        {/* Content */}
+        {step === "chat" && (
+          <form onSubmit={handleSendMessage} className="flex flex-col flex-1">
+            <div className="flex-1 overflow-y-auto p-4 space-y-4">
+              {messages.map((msg, i) => (
+                <div
+                  key={i}
+                  className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
+                  <div
+                    className={`max-w-[75%] p-3 rounded-lg ${
+                      msg.role === "user" ? "bg-blue-600 text-white" : "bg-gray-100 text-gray-800"
+                    }`}
+                  >
+                    {msg.content}
+                  </div>
+                </div>
+              ))}
+              <div ref={messagesEndRef} />
+            </div>
+            <div className="p-4 border-t flex space-x-2">
+              <input
+                className="flex-1 border rounded px-3 py-2"
+                placeholder="Describe your invoice..."
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                disabled={isProcessing}
+              />
+              <button
+                type="submit"
+                className="bg-blue-600 text-white px-4 py-2 rounded"
+                disabled={isProcessing}
+              >
+                Send
+              </button>
+            </div>
+          </form>
+        )}
+
+        {step === "review" && (
+          <div className="p-4 flex-1 flex flex-col">
+            <div className="mb-4">
+              <h3 className="font-medium">Invoice Summary</h3>
+              <p>Service: {extractedData.title}</p>
+              <p>Amount: {extractedData.amount} FTN</p>
+              <p>Deadline: {extractedData.deadline}</p>
+            </div>
+            <div className="mt-auto flex space-x-2">
+              <button
+                onClick={handleEditDetails}
+                className="flex-1 border px-4 py-2 rounded"
+              >
+                Edit
+              </button>
+              <button
+                onClick={handleConfirmDetails}
+                className="flex-1 bg-blue-600 text-white px-4 py-2 rounded"
+              >
+                Confirm
+              </button>
+            </div>
+          </div>
+        )}
+
+        {step === "stake" && (
+          <div className="p-4 flex-1 flex flex-col">
+            <label className="mb-2">Stake Amount (FTN):</label>
+            <input
+              type="number"
+              min="0"
+              step="0.001"
+              value={stakeAmount}
+              onChange={(e) => setStakeAmount(e.target.value)}
+              className="border rounded px-3 py-2 mb-4"
+            />
+            <button
+              onClick={handleStakeAndCreate}
+              className="bg-blue-600 text-white px-4 py-2 rounded mt-auto"
+            >
+              Stake & Create Invoice
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
