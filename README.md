@@ -7,6 +7,7 @@
 
 In Web3 freelance, DAO, and B2B workflows, informal coordination still dominates — chats, spreadsheets, and soft promises. StakePay replaces this with lightweight, AI-generated smart contracts and a programmable trust mechanism.
 
+Video: https://youtu.be/FrYG2dhG5aU
 
 
 ## 🔧 Features
